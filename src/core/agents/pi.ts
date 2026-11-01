@@ -1,5 +1,14 @@
 import { execFileSync, spawn } from "node:child_process";
-import { createWriteStream } from "node:fs";
+import {
+  createWriteStream,
+  existsSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   buildAgentOutputSchema,
   parseAgentOutput,
@@ -84,19 +93,228 @@ function terminatePiProcess(
   child.kill("SIGTERM");
 }
 
-function buildPiPrompt(prompt: string, schema: AgentOutputSchema): string {
-  return `${prompt}
+const FINISH_TOOL = "gnhf_finish";
 
-## gnhf final output contract
-
-When the iteration is complete, your final assistant response must be only valid JSON matching this JSON Schema. Do not wrap it in Markdown fences. Do not include prose before or after the JSON object.
-
-${JSON.stringify(schema, null, 2)}`;
+/**
+ * Finds the Pi extension that ships with gnhf (`extensions/gnhf-finish.ts` at
+ * the package root) by walking up from this module, which works for both the
+ * bundled `dist/cli.mjs` and the TypeScript sources.
+ */
+function findFinishExtension(): string {
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 6; i += 1) {
+    const candidate = join(dir, "extensions", "gnhf-finish.ts");
+    if (existsSync(candidate)) return candidate;
+    dir = dirname(dir);
+  }
+  throw new Error("gnhf Pi extension extensions/gnhf-finish.ts not found");
 }
 
-function buildPiArgs(extraArgs?: string[], model?: string): string[] {
+function matchesToolPattern(pattern: string, name: string): boolean {
+  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^${escaped.replace(/\*/g, ".*")}$`).test(name);
+}
+
+const TOOL_LIST_FLAGS = ["--tools", "-t"];
+const TOOL_EXCLUDE_FLAGS = ["--exclude-tools", "-xt"];
+
+// How pi 1.4.0's own parser (cli/args.js) consumes the next argument as a
+// value, for every option other than the tool options handled below.
+const VALUE_FLAGS = new Set([
+  "--provider",
+  "--model",
+  "--api-key",
+  "--system-prompt",
+  "--append-system-prompt",
+  "--name",
+  "-n",
+  "--session",
+  "--session-id",
+  "--fork",
+  "--session-dir",
+  "--models",
+  "--thinking",
+  "--export",
+  "--extension",
+  "-e",
+  "--skill",
+  "--prompt-template",
+  "--theme",
+]);
+const DASH_GUARDED_VALUE_FLAGS = new Set([
+  "--mode",
+  "--use-theme",
+  "--tui-mode",
+]);
+const NO_VALUE_FLAGS = new Set([
+  "--help",
+  "-h",
+  "--version",
+  "-v",
+  "--continue",
+  "-c",
+  "--resume",
+  "-r",
+  "--no-session",
+  "--no-tools",
+  "-nt",
+  "--no-builtin-tools",
+  "-nbt",
+  "--no-extensions",
+  "-ne",
+  "--no-mcp",
+  "--no-skills",
+  "-ns",
+  "--no-prompt-templates",
+  "-np",
+  "--no-themes",
+  "--no-context-files",
+  "-nc",
+  "--verbose",
+  "--approve",
+  "-a",
+  "--no-approve",
+  "-na",
+  "--offline",
+]);
+
+/** Whether pi takes `next` as the value of the non-tool option `arg`. */
+function consumesNext(arg: string, next: string | undefined): boolean {
+  if (next === undefined) return false;
+  if (VALUE_FLAGS.has(arg)) return true;
+  if (DASH_GUARDED_VALUE_FLAGS.has(arg)) return !next.startsWith("-");
+  if (arg === "--list-models") {
+    return !next.startsWith("-") && !next.startsWith("@");
+  }
+  if (arg === "--print" || arg === "-p") {
+    return (
+      !next.startsWith("@") && (!next.startsWith("-") || next.startsWith("---"))
+    );
+  }
+  if (NO_VALUE_FLAGS.has(arg) || !arg.startsWith("--") || arg.includes("=")) {
+    return false;
+  }
+  // An unknown long option takes a following plain word as its value.
+  return !next.startsWith("-") && !next.startsWith("@");
+}
+
+function toolEntries(value: string): string[] {
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+const isToolModifier = (entry: string) => /^[+-]/.test(entry);
+
+/**
+ * Returns the user-supplied Pi option that leaves gnhf_finish unavailable, if
+ * any: a tool option that drops it from the effective tool set, or an option
+ * that swallows or cuts off gnhf's own `-e` extension argument. This follows
+ * how pi 1.4.0 itself reads its options: an option consumes the next
+ * argument, the last `--tools` and `--exclude-tools` win, `--tools` is either
+ * an allowlist of names and patterns or only `+name`/`-name` modifiers (an
+ * invalid list is ignored), modifiers edit the default tools and, beside
+ * `--no-tools`, are the allowed set, `--exclude-tools` applies last, and an
+ * empty allowlist allows nothing. e2e/e2e-pi-finish.test.ts checks these
+ * rules against the real pi.
+ */
+export function findToolFilterConflict(
+  args: string[] = [],
+): string | undefined {
+  // gnhf appends `-e <extension>` after the user's args.
+  const all = [...args, "-e", "gnhf-finish.ts"];
+  let noTools: string | undefined;
+  let allow: { shown: string; entries: string[] } | undefined;
+  let exclude: { shown: string; entries: string[] } | undefined;
+  let stopper: string | undefined;
+  let extensionLoaded = false;
+
+  for (let i = 0; i < all.length; i += 1) {
+    const arg = all[i];
+    if (i === args.length) extensionLoaded = true;
+    if (arg === "--") {
+      stopper = "--";
+      break;
+    }
+    if (arg === "--no-tools" || arg === "-nt") {
+      noTools = arg;
+      continue;
+    }
+    const isAllow = TOOL_LIST_FLAGS.includes(arg);
+    if (!isAllow && !TOOL_EXCLUDE_FLAGS.includes(arg)) {
+      if (consumesNext(arg, all[i + 1])) {
+        i += 1;
+        if (i === args.length) {
+          extensionLoaded = false;
+          stopper = `${arg} (no value)`;
+        }
+      }
+      continue;
+    }
+    if (i + 1 >= all.length) continue;
+    i += 1;
+    if (i === args.length) {
+      extensionLoaded = false;
+      stopper = `${arg} (no value)`;
+    }
+    const entries = toolEntries(all[i]);
+    const shown = `${arg} ${all[i]}`;
+    if (!isAllow) {
+      exclude = { shown, entries };
+      continue;
+    }
+    const modifiers = entries.filter(isToolModifier);
+    const invalid =
+      modifiers.length > 0 &&
+      (modifiers.length < entries.length ||
+        modifiers.some((entry) => entry.includes("*")));
+    if (!invalid) allow = { shown, entries };
+  }
+  if (!extensionLoaded) return stopper;
+
+  const isFinish = (entry: string) => matchesToolPattern(entry, FINISH_TOOL);
+  let culprit = noTools;
+  let kept = !noTools;
+  if (allow) {
+    if (allow.entries.some(isToolModifier)) {
+      // Modifiers edit the default tools; only `--no-tools` makes them the
+      // whole allowed set.
+      if (noTools) {
+        const selected = new Set<string>();
+        for (const entry of allow.entries) {
+          if (entry.startsWith("+")) selected.add(entry.slice(1));
+          else selected.delete(entry.slice(1));
+        }
+        kept = selected.has(FINISH_TOOL);
+      }
+    } else {
+      culprit = allow.shown;
+      kept = allow.entries.some(isFinish);
+    }
+  }
+  if (!kept) return culprit;
+  if (exclude?.entries.some(isFinish)) return exclude.shown;
+  return undefined;
+}
+
+function buildPiPrompt(prompt: string): string {
+  return `${prompt}
+
+## gnhf final output
+
+When the iteration is complete, report its result by calling the ${FINISH_TOOL} tool.`;
+}
+
+function buildPiArgs(
+  extensionPath: string,
+  extraArgs?: string[],
+  model?: string,
+): string[] {
   return [
     ...(extraArgs ?? []),
+    "-e",
+    extensionPath,
     ...(model ? ["--model", model] : []),
     "--mode",
     "json",
@@ -166,42 +384,12 @@ function roleOf(message: unknown): string | undefined {
     : undefined;
 }
 
-function textFromContentBlock(block: unknown): string | null {
-  if (typeof block === "string") return block;
-  if (!isRecord(block)) return null;
-  if (typeof block.text === "string") return block.text;
-  if (typeof block.content === "string") return block.content;
-  return null;
-}
-
-function textFromAssistantMessage(message: JsonRecord | null): string {
-  if (!message) return "";
-
-  if (typeof message.text === "string") return message.text;
-  if (typeof message.content === "string") return message.content;
-  if (Array.isArray(message.content)) {
-    return message.content
-      .map(textFromContentBlock)
-      .filter((text): text is string => text !== null)
-      .join("");
-  }
-
-  return "";
-}
-
 function compactJson(value: unknown): string {
   try {
     return JSON.stringify(value);
   } catch {
     return String(value);
   }
-}
-
-function textByIndexToString(textByIndex: Map<number, string>): string {
-  return [...textByIndex.entries()]
-    .sort(([a], [b]) => a - b)
-    .map(([, text]) => text)
-    .join("");
 }
 
 export class PiAgent implements Agent {
@@ -216,6 +404,12 @@ export class PiAgent implements Agent {
   constructor(deps: PiAgentDeps = {}) {
     this.bin = deps.bin ?? "pi";
     this.extraArgs = deps.extraArgs;
+    const conflict = findToolFilterConflict(deps.extraArgs);
+    if (conflict) {
+      throw new Error(
+        `pi option "${conflict}" would make ${FINISH_TOOL} unavailable, which gnhf needs to read the iteration result. Allow ${FINISH_TOOL} in the option or remove it from the pi agent args.`,
+      );
+    }
     this.model = deps.model;
     this.platform = deps.platform ?? process.platform;
     this.schema =
@@ -229,17 +423,31 @@ export class PiAgent implements Agent {
   ): Promise<AgentResult> {
     const { onUsage, onMessage, signal, logPath } = options ?? {};
 
-    return new Promise((resolve, reject) => {
-      const logStream = logPath ? createWriteStream(logPath) : null;
-      const child = spawn(this.bin, buildPiArgs(this.extraArgs, this.model), {
-        cwd,
-        detached: this.platform !== "win32",
-        shell: shouldUseWindowsShell(this.bin, this.platform),
-        stdio: ["pipe", "pipe", "pipe"],
-        env: process.env,
-      });
+    const useShell = shouldUseWindowsShell(this.bin, this.platform);
+    // A shell joins argv with spaces, so a package path with spaces must be
+    // quoted; Windows paths cannot contain double quotes.
+    const extensionPath = useShell
+      ? `"${findFinishExtension()}"`
+      : findFinishExtension();
+    const schemaDir = mkdtempSync(join(tmpdir(), "gnhf-pi-"));
+    const schemaPath = join(schemaDir, "output-schema.json");
+    writeFileSync(schemaPath, JSON.stringify(this.schema));
 
-      child.stdin?.write(buildPiPrompt(prompt, this.schema));
+    return new Promise<AgentResult>((resolve, reject) => {
+      const logStream = logPath ? createWriteStream(logPath) : null;
+      const child = spawn(
+        this.bin,
+        buildPiArgs(extensionPath, this.extraArgs, this.model),
+        {
+          cwd,
+          detached: this.platform !== "win32",
+          shell: useShell,
+          stdio: ["pipe", "pipe", "pipe"],
+          env: { ...process.env, GNHF_PI_OUTPUT_SCHEMA: schemaPath },
+        },
+      );
+
+      child.stdin?.write(buildPiPrompt(prompt));
       child.stdin?.end();
 
       if (
@@ -251,8 +459,9 @@ export class PiAgent implements Agent {
       }
 
       let latestAssistantMessage: JsonRecord | null = null;
+      let finishArgs: unknown;
+      let finished = false;
       const streamTextByIndex = new Map<number, string>();
-      const completeTextByIndex = new Map<number, string>();
       const usageByMessageKey = new Map<string, TokenUsage>();
       let lastEmittedUsage: TokenUsage = {
         inputTokens: 0,
@@ -311,6 +520,17 @@ export class PiAgent implements Agent {
       parseJSONLStream<JsonRecord>(child.stdout!, logStream, (event) => {
         if (!isRecord(event)) return;
 
+        if (
+          event.type === "tool_execution_end" &&
+          event.toolName === FINISH_TOOL &&
+          event.isError !== true &&
+          isRecord(event.result) &&
+          "details" in event.result
+        ) {
+          finishArgs = event.result.details;
+          finished = true;
+        }
+
         if (event.type === "message_update") {
           rememberAssistantMessage(event.message, true);
 
@@ -340,7 +560,6 @@ export class PiAgent implements Agent {
                 stringField(assistantEvent, ["text", "content"]) ??
                 streamTextByIndex.get(contentIndex) ??
                 "";
-              completeTextByIndex.set(contentIndex, text);
               const visible = text.trim();
               if (visible) onMessage?.(visible);
             }
@@ -382,30 +601,29 @@ export class PiAgent implements Agent {
           }
         }
 
-        const finalText =
-          textFromAssistantMessage(latestAssistantMessage).trim() ||
-          textByIndexToString(completeTextByIndex).trim() ||
-          textByIndexToString(streamTextByIndex).trim();
-
-        if (!finalText) {
-          reject(new Error("pi returned no text output"));
+        if (!finished) {
+          reject(new Error(`pi ended without calling ${FINISH_TOOL}`));
           return;
         }
 
         let output: AgentOutput;
         try {
-          output = parseAgentOutput(finalText, this.schema, "pi");
+          output = parseAgentOutput(
+            JSON.stringify(finishArgs),
+            this.schema,
+            "pi",
+          );
         } catch (err) {
-          const message =
-            err instanceof SyntaxError
-              ? `Failed to parse pi output: ${err.message}`
-              : `Invalid pi output: ${err instanceof Error ? err.message : err}`;
-          reject(new Error(message));
+          reject(
+            new Error(
+              `Invalid pi output: ${err instanceof Error ? err.message : err}`,
+            ),
+          );
           return;
         }
 
         resolve({ output, usage: lastEmittedUsage });
       });
-    });
+    }).finally(() => rmSync(schemaDir, { recursive: true, force: true }));
   }
 }

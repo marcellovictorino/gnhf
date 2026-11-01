@@ -40,6 +40,7 @@
   },
   "files": [
     "dist",
+    "extensions",
     "skills",
     "LICENSE",
     "README.md"
