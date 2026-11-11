@@ -7,6 +7,7 @@ This file provides guidance to agents when working with code in this repository.
 `gnhf` ("good night, have fun") is a CLI that runs a coding agent in a loop inside a git repo, committing each successful iteration.
 User-facing behavior (run modes, failure/rollback, usage-limit waits, worktrees, sleep prevention, agents) is owned by the [README](./README.md); test feature or scope decisions against [VISION.md](./VISION.md).
 Target: Node 20+, published to npm as a bundled ESM CLI (`dist/cli.mjs`) with optional agent-facing skills under `skills/`.
+Care: Careful
 
 ## Commands
 
